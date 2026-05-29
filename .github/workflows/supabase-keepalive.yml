@@ -1,0 +1,72 @@
+name: Supabase Keep-Alive
+
+# Supabase pauses free-tier projects after 7 days with no DATABASE activity
+# (dashboard visits and idle API endpoints do not count). This workflow
+# performs a real write — one row inserted into public.keep_alive — a few
+# times a week so the project never crosses the inactivity threshold.
+#
+# Why a write and not a read: read pings can be cached or return nothing
+# under RLS and have been reported to stop counting as activity. An INSERT
+# unambiguously registers.
+#
+# Credentials live in repo secrets, never in this file:
+#   SUPABASE_URL            e.g. https://<ref>.supabase.co
+#   SUPABASE_KEEPALIVE_KEY  the public "publishable" (anon) key — the same
+#                           one shipped in the app; the keep_alive RLS policy
+#                           allows this key INSERT-only on that one table.
+
+on:
+  schedule:
+    # 06:14 UTC, Mon / Wed / Fri. Three runs a week means the largest gap
+    # (Fri -> Mon) is ~3 days, well inside the 7-day window, so a single
+    # delayed or dropped GitHub run is never enough to trigger a pause.
+    # The :14 minute avoids top-of-the-hour congestion, when GitHub is
+    # most likely to delay or skip scheduled jobs.
+    - cron: "14 6 * * 1,3,5"
+  # Lets us trigger a run by hand from the Actions tab to verify it works.
+  workflow_dispatch: {}
+
+# If a manual run overlaps a scheduled one, just keep the latest.
+concurrency:
+  group: supabase-keepalive
+  cancel-in-progress: true
+
+jobs:
+  ping:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Insert keep-alive ping
+        env:
+          SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+          SUPABASE_KEY: ${{ secrets.SUPABASE_KEEPALIVE_KEY }}
+        run: |
+          set -euo pipefail
+
+          if [ -z "${SUPABASE_URL:-}" ] || [ -z "${SUPABASE_KEY:-}" ]; then
+            echo "::error::Missing SUPABASE_URL or SUPABASE_KEEPALIVE_KEY secret."
+            exit 1
+          fi
+
+          # POST an empty object: id is identity, pinged_at and source use
+          # their column defaults. Prefer: return=minimal -> HTTP 201, no body,
+          # so the anon role needs only INSERT (no SELECT) on the table.
+          status=$(curl --silent --show-error --fail-with-body \
+            --output /dev/stderr --write-out "%{http_code}" \
+            --max-time 30 \
+            -X POST "${SUPABASE_URL}/rest/v1/keep_alive" \
+            -H "apikey: ${SUPABASE_KEY}" \
+            -H "Authorization: Bearer ${SUPABASE_KEY}" \
+            -H "Content-Type: application/json" \
+            -H "Prefer: return=minimal" \
+            -d '{}') || {
+              echo "::error::Keep-alive request failed (HTTP ${status:-000})."
+              exit 1
+            }
+
+          if [ "$status" != "201" ]; then
+            echo "::error::Expected HTTP 201, got ${status}."
+            exit 1
+          fi
+
+          echo "Keep-alive ping inserted (HTTP ${status})."
