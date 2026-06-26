@@ -1,42 +1,50 @@
 name: Supabase Keep-Alive
 
-# Supabase pauses free-tier projects after 7 days with no DATABASE activity
-# (dashboard visits and idle API endpoints do not count). This workflow
-# performs a real write — one row inserted into public.keep_alive — a few
-# times a week so the project never crosses the inactivity threshold.
+# Supabase pauses Free-plan projects with insufficient DATABASE activity over
+# a rolling 7-day window. Per Supabase's own docs, the threshold is framed in
+# DAILY terms:
 #
-# Why a write and not a read: read pings can be cached or return nothing
-# under RLS and have been reported to stop counting as activity. An INSERT
-# unambiguously registers.
+#   "A Free plan project is considered inactive if it does not receive
+#    sufficient user database activity over the past week ... Typically a few
+#    user requests to the database each day over the previous week is enough
+#    to keep the project from being paused."
+#   https://supabase.com/docs/guides/platform/free-project-pausing
+#
+# An earlier version of this workflow ran only 3x/week (Mon/Wed/Fri). The DB
+# writes succeeded and rows landed, but 4 of every 7 days had zero activity —
+# below the "a few requests each day" bar — and the project was paused anyway.
+#
+# Fix: run DAILY (twice, for redundancy against GitHub occasionally delaying or
+# dropping a scheduled run) and issue a few writes per run, so every day has
+# unambiguous database activity.
 #
 # Credentials live in repo secrets, never in this file:
-#   SUPABASE_URL            e.g. https://<ref>.supabase.co
-#   SUPABASE_KEEPALIVE_KEY  the public "publishable" (anon) key — the same
-#                           one shipped in the app; the keep_alive RLS policy
-#                           allows this key INSERT-only on that one table.
+#   SUPABASE_URL            https://<ref>.supabase.co
+#   SUPABASE_KEEPALIVE_KEY  the public "publishable" (anon) key already shipped
+#                           in the app; the keep_alive RLS policy grants this
+#                           key INSERT-only on that one table.
 
 on:
   schedule:
-    # 06:14 UTC, Mon / Wed / Fri. Three runs a week means the largest gap
-    # (Fri -> Mon) is ~3 days, well inside the 7-day window, so a single
-    # delayed or dropped GitHub run is never enough to trigger a pause.
-    # The :14 minute avoids top-of-the-hour congestion, when GitHub is
-    # most likely to delay or skip scheduled jobs.
-    - cron: "14 6 * * 1,3,5"
+    # 06:14 and 18:14 UTC, every day. Two runs ~12h apart means every calendar
+    # day gets activity even if one run is delayed or dropped. The :14 minute
+    # avoids top-of-the-hour congestion when GitHub is most likely to skip jobs.
+    - cron: "14 6 * * *"
+    - cron: "14 18 * * *"
   # Lets us trigger a run by hand from the Actions tab to verify it works.
   workflow_dispatch: {}
 
-# If a manual run overlaps a scheduled one, just keep the latest.
+# Don't cancel an in-flight ping; let every run finish. Just avoid piling up.
 concurrency:
   group: supabase-keepalive
-  cancel-in-progress: true
+  cancel-in-progress: false
 
 jobs:
   ping:
     runs-on: ubuntu-latest
     timeout-minutes: 5
     steps:
-      - name: Insert keep-alive ping
+      - name: Insert keep-alive pings
         env:
           SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
           SUPABASE_KEY: ${{ secrets.SUPABASE_KEEPALIVE_KEY }}
@@ -48,25 +56,31 @@ jobs:
             exit 1
           fi
 
-          # POST an empty object: id is identity, pinged_at and source use
-          # their column defaults. Prefer: return=minimal -> HTTP 201, no body,
-          # so the anon role needs only INSERT (no SELECT) on the table.
-          status=$(curl --silent --show-error --fail-with-body \
-            --output /dev/stderr --write-out "%{http_code}" \
-            --max-time 30 \
-            -X POST "${SUPABASE_URL}/rest/v1/keep_alive" \
-            -H "apikey: ${SUPABASE_KEY}" \
-            -H "Authorization: Bearer ${SUPABASE_KEY}" \
-            -H "Content-Type: application/json" \
-            -H "Prefer: return=minimal" \
-            -d '{}') || {
-              echo "::error::Keep-alive request failed (HTTP ${status:-000})."
+          # Issue a few separate writes so the day clearly registers as active.
+          # Each POST of an empty object inserts a row using column defaults
+          # (id identity, pinged_at now(), source default). Prefer: return=minimal
+          # -> HTTP 201 with no body, so the anon role needs only INSERT.
+          PINGS=3
+          for i in $(seq 1 "$PINGS"); do
+            status=$(curl --silent --show-error --fail-with-body \
+              --output /dev/stderr --write-out "%{http_code}" \
+              --max-time 30 \
+              -X POST "${SUPABASE_URL}/rest/v1/keep_alive" \
+              -H "apikey: ${SUPABASE_KEY}" \
+              -H "Authorization: Bearer ${SUPABASE_KEY}" \
+              -H "Content-Type: application/json" \
+              -H "Prefer: return=minimal" \
+              -d '{}') || {
+                echo "::error::Keep-alive request $i/$PINGS failed (HTTP ${status:-000})."
+                exit 1
+              }
+
+            if [ "$status" != "201" ]; then
+              echo "::error::Request $i/$PINGS: expected HTTP 201, got ${status}."
               exit 1
-            }
+            fi
+            echo "Ping $i/$PINGS inserted (HTTP ${status})."
+            sleep 1
+          done
 
-          if [ "$status" != "201" ]; then
-            echo "::error::Expected HTTP 201, got ${status}."
-            exit 1
-          fi
-
-          echo "Keep-alive ping inserted (HTTP ${status})."
+          echo "Keep-alive complete: ${PINGS} pings inserted."
